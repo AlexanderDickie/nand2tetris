@@ -2,4 +2,5 @@
 
 members = [
     "vm-translator",
+    "jack_to_vm",
 ]
