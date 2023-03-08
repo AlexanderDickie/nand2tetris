@@ -1,5 +1,10 @@
 use chumsky::{prelude::*, text::ident};
-use std::fs;
+use vm::class_to_vm;
+use core::panic;
+use std::{fs, path::Path};
+
+mod vm;
+
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Token {
@@ -87,7 +92,7 @@ macro_rules! token_string_constant (
         Token::String($k)
     });
 );
-fn lexer() -> impl Parser<char, Vec<Token>, Error=Simple<char>> {
+pub fn lexer() -> impl Parser<char, Vec<Token>, Error=Simple<char>> {
     // this will allow 111abc parsed as Token::Int and Token::Ident
     let keyword = choice((
         just("class").to(token_keyword!(Class)),
@@ -198,20 +203,20 @@ enum KeyConst {
 }
 #[derive(Clone, Debug)]
 enum UnaryOp {
-    Minus,
-    Tilde,
+    Neg,
+    Not,
 }
 #[derive(Clone, Debug)]
 enum Op {
-    Plus,
-    Minus,
-    Asterisk,
-    Slash,
-    Ampersand,
-    Pipe,
-    LessThan,
-    GreaterThan,
-    Equal,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    And,
+    Or,
+    Lt,
+    Gt,
+    Eq,
 }
 fn parse_expr() -> impl Parser<Token, Expr, Error=Simple<Token>> + Clone{
     recursive(|expr| {
@@ -247,8 +252,8 @@ fn parse_expr() -> impl Parser<Token, Expr, Error=Simple<Token>> + Clone{
                 .map(|_expr| Term::BracketedExpr(_expr));
 
             let unary_op = select! {
-                Token::Symbol(Symbol::Minus) => UnaryOp::Minus,
-                Token::Symbol(Symbol::Tilde) => UnaryOp::Tilde,
+                Token::Symbol(Symbol::Minus) => UnaryOp::Neg,
+                Token::Symbol(Symbol::Tilde) => UnaryOp::Not,
             }
                 .then(term.clone())
                 .map(|(op, _term)| Term::UnaryOp(op, Box::new(_term)));
@@ -263,15 +268,15 @@ fn parse_expr() -> impl Parser<Token, Expr, Error=Simple<Token>> + Clone{
         });
 
         let op = select! {
-            Token::Symbol(Symbol::Plus) => Op::Plus,
-            Token::Symbol(Symbol::Minus) => Op::Minus,
-            Token::Symbol(Symbol::Asterisk) => Op::Asterisk,
-            Token::Symbol(Symbol::Slash) => Op::Slash,
-            Token::Symbol(Symbol::Ampersand) => Op::Ampersand,
-            Token::Symbol(Symbol::Pipe) => Op::Pipe,
-            Token::Symbol(Symbol::LessThan) => Op::LessThan,
-            Token::Symbol(Symbol::GreaterThan) => Op::GreaterThan,
-            Token::Symbol(Symbol::Equal) => Op::Equal,
+            Token::Symbol(Symbol::Plus) => Op::Add,
+            Token::Symbol(Symbol::Minus) => Op::Sub,
+            Token::Symbol(Symbol::Asterisk) => Op::Mul,
+            Token::Symbol(Symbol::Slash) => Op::Div,
+            Token::Symbol(Symbol::Ampersand) => Op::And,
+            Token::Symbol(Symbol::Pipe) => Op::Or,
+            Token::Symbol(Symbol::LessThan) => Op::Lt,
+            Token::Symbol(Symbol::GreaterThan) => Op::Gt,
+            Token::Symbol(Symbol::Equal) => Op::Eq,
         };
 
         // term (op term)*
@@ -294,7 +299,7 @@ fn parse_sub_call(parse_expr: impl Parser<Token, Expr, Error=Simple<Token>> + Cl
                     .repeated()
             )
             .map(|(first, mut rest)| {
-                rest.push(first);
+                rest.insert(0, first);
                 rest
             })
             .or(empty().map(|_| vec![]));
@@ -404,14 +409,14 @@ fn parse_statements()
         _let.or(_if).or(_while).or(_do).or(_return).repeated()
     })
 }
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Type {
     Int,
     Char,
     Bool,
     Object(String),
 }
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum ClassVarKind {Static, Field}
 #[derive(Debug)]
 struct ClassVarDecl {
@@ -428,7 +433,7 @@ struct SubroutineDecl {
     kind: SubroutineKind,
     name: String,
     return_type: Option<Type>,
-    params: Vec<(Type, String)>,
+    args: Vec<(Type, String)>,
     body: SubroutineBody,
 }
 #[derive(Debug)]
@@ -437,12 +442,12 @@ struct SubroutineBody {
     statements: Vec<Statement>,
 }
 #[derive(Debug)]
-struct Class {
+pub struct Class {
     name: String,
     var_decls: Vec<ClassVarDecl>,
     sub_decls: Vec<SubroutineDecl>,
 }
-fn parse_class() -> impl Parser<Token, Class, Error=Simple<Token>> {
+pub fn parse_class() -> impl Parser<Token, Class, Error=Simple<Token>> {
     let ident = select! {Token::Ident(i) => i.clone()};
 
     let parse_type = select! {
@@ -465,7 +470,7 @@ fn parse_class() -> impl Parser<Token, Class, Error=Simple<Token>> {
             .repeated())
         .then_ignore(just(token_symbol!(Semicolon)))
         .map(|(((kind, _type), first), mut rest)| {
-            rest.push(first);
+            rest.insert(0, first);
             ClassVarDecl {kind, _type, names: rest}
         });
 
@@ -482,7 +487,7 @@ fn parse_class() -> impl Parser<Token, Class, Error=Simple<Token>> {
         )
         .map(|(opt, mut rest)| {
             if let Some(tup) = opt {
-                rest.push(tup);
+                rest.insert(0, tup);
             }
             rest
         });
@@ -503,7 +508,7 @@ fn parse_class() -> impl Parser<Token, Class, Error=Simple<Token>> {
         )
         .then_ignore(just(token_symbol!(Semicolon)))
         .map(|((_type, first), mut rest)| {
-            rest.push(first);
+            rest.insert(0, first);
             (_type, rest)
         });
     let subroutine_body = 
@@ -527,9 +532,9 @@ fn parse_class() -> impl Parser<Token, Class, Error=Simple<Token>> {
             just(token_symbol!(RightParen)),
         ))
         .then(subroutine_body)
-        .map(|((((kind, return_type), name), params), body)| 
+        .map(|((((kind, return_type), name), args), body)| 
             SubroutineDecl {
-                kind, name, return_type, params, body,
+                kind, name, return_type, args, body,
             }
         );
 
@@ -544,16 +549,28 @@ fn parse_class() -> impl Parser<Token, Class, Error=Simple<Token>> {
 
 
 fn main() {
-    let file = std::env::args().nth(1).unwrap();
-    let file = fs::read_to_string(file).unwrap();
+    // read directory
+    let path = std::env::args().nth(1).unwrap();
+    let path = Path::new(&path);
+    if !path.is_dir() {
+        panic!("path not a directory");
+    }
 
-    let tokens = lexer().parse(file).unwrap();
-    let tokens = tokens
-        .into_iter()
-        .filter(|t| *t != Token::Comment)
-        .collect::<Vec<_>>();
-    println!("{:?}\n", tokens);
+    for file in path.read_dir().unwrap() {
+        let file_path = file.unwrap().path();
 
-    let class = parse_class().parse(tokens);
-    println!("{:?}", class);
+        if file_path.extension().unwrap() == "jack" {
+            let tokens = lexer().parse(fs::read_to_string(&file_path).unwrap()).expect("lex error");
+            let tokens = tokens
+                .into_iter()
+                .filter(|t| *t != Token::Comment)
+                .collect::<Vec<_>>();
+            let class = parse_class().parse(tokens).expect("failed to parse class");
+            let vm = class_to_vm(&class);
+            fs::write(file_path.with_extension("vm"), vm.join("\n")).expect("failed to write");
+        }
+    }
 }
+
+
+
